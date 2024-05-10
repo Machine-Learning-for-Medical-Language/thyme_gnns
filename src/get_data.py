@@ -17,13 +17,15 @@ import torchtext
 from dgl.dataloading import GraphDataLoader
 from model_utils import Homogenizer
 from scipy.linalg import block_diag
+from temporal_closure import extrapolate
 from torchtext.data.utils import get_tokenizer
 from tqdm import tqdm
 from typing import Any, List, Set, Dict, Tuple, Union, Optional, Callable
 from utils import get_device
 
 
-DEVICE = get_device()
+# DEVICE = get_device()
+DEVICE = "cpu"
 
 doctime_etypes = {
     ("event", "AFTER", "DocTime"),
@@ -44,8 +46,8 @@ def load_graph(
         return None
     if "relations" not in data or len(data["relations"]) == 0:
         return None
-    data["event"] = data["events"]
     data["timex"] = data["timexes"]
+    data["event"] = data["events"]
     del data["events"], data["timexes"]
     return data
 
@@ -176,6 +178,10 @@ def get_vocab_and_pipeline(
                 edge_categories.add(
                     ("DocTime", category_reverse(dct["event"][event]["dtr"]), "event")
                 )
+                edge_categories.add(("timex", dct["event"][event]["dtr"], "DocTime"))
+                edge_categories.add(
+                    ("DocTime", category_reverse(dct["event"][event]["dtr"]), "timex")
+                )
             for relation in dct["relations"]:  # inter-entity relations
                 arg1_type = relation["arg1"].split("_")[0].lower()
                 arg2_type = relation["arg2"].split("_")[0].lower()
@@ -291,18 +297,26 @@ def graphify(
     max_len: int = 4,
     pretrained: bool = False,
     use_doctime: bool = True,
+    temporal_closure: bool = False,
 ) -> List[dgl.DGLGraph]:
     logging.info("Graphifying data")
     out = []
     for datum in tqdm(data):  # datum = one graph/one file
-        graph_data, entity_ids = make_relations(
-            datum, edge_vocab, use_doctime=use_doctime
-        )  # just node indices, representing edges between them
-        for etype in graph_data:
-            graph_data[etype] = (
-                torch.tensor(graph_data[etype]["sources"]),
-                torch.tensor(graph_data[etype]["destinations"]),
-            )
+        datum["timex"] = {timex: datum["timex"][timex] for timex in datum["timex"] if timex.startswith("Timex")}
+        datum["event"] = {event: datum["event"][event] for event in datum["event"] if event.startswith("Event")}
+        if temporal_closure:
+            graph_data, entity_ids = extrapolate(datum)
+            graph_data = {etype: (graph_data[etype][0].to(int), graph_data[etype][1].to(int)) for etype in graph_data}  # to appease dgl
+        else:
+            graph_data, entity_ids = make_relations(
+                datum, edge_vocab, use_doctime=use_doctime
+            )  
+            # just node indices, representing edges between them
+            for etype in graph_data:
+                graph_data[etype] = (
+                    torch.tensor(graph_data[etype]["sources"]),
+                    torch.tensor(graph_data[etype]["destinations"]),
+                )
         # get number of nodes in each category
         num_nodes = 0
         for ntype in entity_ids:
@@ -323,7 +337,7 @@ def graphify(
                 num_nodes += max_id + 1
         if num_nodes == 0:  # empty graph
             continue
-        g = dgl.heterograph(graph_data).to(get_device())
+        g = dgl.heterograph(graph_data).to(DEVICE)
         tokens = {}
         if not pretrained:
             for ntype in g.ntypes:
@@ -336,23 +350,25 @@ def graphify(
                         if ent in entity_ids[ntype]
                         and entity_ids[ntype][ent] in g.nodes(ntype)
                     }
-                    if len(old_datum_ntype) > len(datum[ntype]):  # and ntype!="timex":
-                        pdb.set_trace()
+                    # if len(old_datum_ntype) > len(datum[ntype]):  # and ntype!="timex":
+                    #     pdb.set_trace()
                     # get text for each node
                     # put text through pipeline to get tokens
                     tokens[ntype] = text_pipeline(
                         [datum[ntype][ent]["text"] for ent in datum[ntype]], max_len
-                    ).to(get_device())
+                    ).to(DEVICE)
                 elif ntype == "DocTime":
-                    tokens[ntype] = text_pipeline(["<pad>"], max_len).to(get_device())
+                    tokens[ntype] = text_pipeline(["<pad>"], max_len).to(DEVICE)
             if len(g.ntypes) > 1:
                 g.ndata["tokens"] = tokens
             else:
                 # graph is effectively homogeneous;
                 # dgl will complain if data is not given in tensor format
                 g.ndata["tokens"] = tokens[g.ntypes[0]]
-        if (dgl.to_homogeneous(g).in_degrees() == 0).any():
-            pdb.set_trace()
+        # if (g["timex"].in_degrees() == 0).any():
+        #     isolated_nodes = g.in_degrees()==0
+        #     g.remove_node(isolated_nodes, ntype="timex")
+        #     pdb.set_trace()
         out.append(g)
     return out
 
@@ -385,9 +401,9 @@ def get_loader(
                     if ntype in g.ntypes and len(embeddings[ntype]) > 0
                 }
                 for ntype in embeddings:
-                    embeddings[ntype] = embeddings[ntype].to(get_device())
+                    embeddings[ntype] = embeddings[ntype].to(DEVICE)
                 embeddings["DocTime"] = (
-                    torch.ones((1, 1, emb_dim)).to(get_device()).detach()
+                    torch.ones((1, 1, emb_dim)).to(DEVICE).detach()
                 )
                 try:
                     g.ndata["h"] = embeddings
@@ -461,6 +477,7 @@ def get_data_loaders(
     homogenize: bool = False,
     emb_dim: int = 100,
     use_doctime: bool = "True",
+    temporal_closure: bool = "False",
     motifs_to_use: List[int] = [0],
     motifs_dir: Optional[str] = None,
 ) -> Tuple[torchtext.vocab.Vocab, GraphDataLoader, GraphDataLoader, GraphDataLoader]:
@@ -474,6 +491,11 @@ def get_data_loaders(
         base += (
             f"_{task_name}_os{str(oversample).split('.')[1]}"
             if oversample is not None
+            else ""
+        )
+        base += (
+            "_temporal_closure"
+            if temporal_closure
             else ""
         )
         return base + ".pt"
@@ -532,6 +554,7 @@ def get_data_loaders(
             max_len=max_len,
             pretrained=pretrained_dir is not None,
             use_doctime=use_doctime,
+            temporal_closure=temporal_closure,
         )
         train = list(zip(fnames, labels, dgl_graphs))
 
@@ -543,6 +566,7 @@ def get_data_loaders(
             max_len=max_len,
             pretrained=pretrained_dir is not None,
             use_doctime=use_doctime,
+            temporal_closure=temporal_closure,
         )
         dev = list(zip(fnames, labels, dgl_graphs))
 
@@ -554,6 +578,7 @@ def get_data_loaders(
             max_len=max_len,
             pretrained=pretrained_dir is not None,
             use_doctime=use_doctime,
+            temporal_closure=temporal_closure,
         )
         test = list(zip(fnames, labels, dgl_graphs))
 
@@ -575,6 +600,7 @@ def get_data_loaders(
         emb_dim=emb_dim,
         motifs_to_use=motifs_to_use,
         edge_vocab=edge_vocab,
+        motifs_dir=motifs_dir,
     )
     dev_dataloader = get_loader(
         data=dev,
@@ -585,6 +611,7 @@ def get_data_loaders(
         emb_dim=emb_dim,
         motifs_to_use=motifs_to_use,
         edge_vocab=edge_vocab,
+        motifs_dir=motifs_dir,
     )
 
     test_dataloader = get_loader(
@@ -596,6 +623,7 @@ def get_data_loaders(
         emb_dim=emb_dim,
         motifs_to_use=motifs_to_use,
         edge_vocab=edge_vocab,
+        motifs_dir=motifs_dir,
     )
 
     return (

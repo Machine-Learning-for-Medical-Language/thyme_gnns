@@ -42,9 +42,6 @@ parser.add_argument(
     help="directory where pretrained node embeddings are stored.",
 )
 parser.add_argument(
-    "-s", "--save_dir", type=str, help="path where loaded data will be saved"
-)
-parser.add_argument(
     "-c",
     "--cache",
     default=None,
@@ -55,13 +52,18 @@ parser.add_argument(
     type=str,
     help="path where pretrained embedding layer is stored",
 )
-
 parser.add_argument(
     "-m", 
     "--motifs_dir",
     type=str,
     default=None,
     help="directory where motif adjacency matrices are stored"
+)
+parser.add_argument(
+    "-s",
+    "--save_dir",
+    default=None,
+    help="dir where model and results will be saved"
 )
 
 # data/model arguments
@@ -301,10 +303,8 @@ def main():
         if hyperparameters["batch_size"] > 1
         or hyperparameters["model_type"] == "HGT"
         or (
-            len(
-                hyperparameters["motifs_to_use"] > 1
+            len(hyperparameters["motifs_to_use"]) > 1 \
                 and 0 in hyperparameters["motifs_to_use"]
-            )
         )
         else False
     )
@@ -323,6 +323,7 @@ def main():
         use_doctime=hyperparameters["use_doctime"],
         motifs_to_use=hyperparameters["motifs_to_use"],
         motifs_dir=args.motifs_dir,
+        temporal_closure=hyperparameters["temporal_closure"]
     )
 
     vocab_size = len(vocab)
@@ -340,7 +341,6 @@ def main():
 
     train_classifier(
         model,
-        model_args,
         train_loader,
         dev_loader,
         test_loader,

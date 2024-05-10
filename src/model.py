@@ -134,6 +134,7 @@ class GCNClassifier(Classifier):
         allow_zero_in_degree: bool = False,
         linear_activation: bool = False,
         agg_type: Optional[str] = None,
+        linear_dims: Optional[List[int]] = None,
         **kwargs,
     ):
         super().__init__(
