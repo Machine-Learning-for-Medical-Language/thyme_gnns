@@ -14,7 +14,7 @@ import sys
 
 os.environ["DGLBACKEND"] = "pytorch"
 import dgl
-from sklearn.metrics import precision_recall_fscore_support, f1_score
+from sklearn.metrics import precision_recall_fscore_support, f1_score, roc_auc_score
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from typing import Any, List, Set, Dict, Tuple, Union, Optional, Callable
@@ -23,6 +23,7 @@ from get_data import get_data_loaders
 from model import (
     GCNClassifier,
     EGATClassifier,
+    HeteroGCNClassifier,
     HGTClassifier,
     GATClassifier,
     MotifClassifier,
@@ -53,20 +54,17 @@ parser.add_argument(
     help="path where pretrained embedding layer is stored",
 )
 parser.add_argument(
-    "-m", 
+    "-m",
     "--motifs_dir",
     type=str,
     default=None,
-    help="directory where motif adjacency matrices are stored"
+    help="directory where motif adjacency matrices are stored",
 )
 parser.add_argument(
-    "-s",
-    "--save_dir",
-    default=None,
-    help="dir where model and results will be saved"
+    "-s", "--save_dir", default=None, help="dir where model and results will be saved"
 )
 
-# data/model arguments
+# training/model arguments
 parser.add_argument(
     "-t", "--task_names", nargs="+", help="data columns to use as labels"
 )
@@ -90,6 +88,11 @@ parser.add_argument(
     action="store_true",
     help="delete model after testing. this allows the user to load the best model for training, without taking up extra storage space.",
 )
+parser.add_argument(
+    "--error_analysis",
+    action="store_true",
+    help="save results of train, dev, and test evaluation",
+)
 args = parser.parse_args()
 
 
@@ -100,6 +103,8 @@ def get_model(
     match hyperparameters["model_type"]:
         case "GCN":
             return GCNClassifier(**model_args)
+        case "HeteroGCN":
+            return HeteroGCNClassifier(**model_args)
         case "HGT":
             return HGTClassifier(**model_args)
         case "GAT":
@@ -134,6 +139,7 @@ def evaluate(
     model_loss_fn: Callable,
     classes: List,
     device: str = "cuda",
+    return_predictions: bool = False,
 ):
     num_classes = len(classes)
     total, total_correct, total_loss = 0, 0, 0
@@ -190,7 +196,19 @@ def evaluate(
             average="weighted",
             zero_division=0.0,
         )
-        return {"stats": stats_df, "weighted_f1": weighted_f1, "loss": total_loss}
+        auc = roc_auc_score(
+            labels.to("cpu", dtype=torch.float64),
+            predictions.to("cpu", dtype=torch.float64),
+        )
+        out = {
+            "stats": stats_df,
+            "weighted_f1": weighted_f1,
+            "loss": total_loss,
+            "auc": auc,
+        }
+        if return_predictions:
+            out["predictions"] = predictions
+        return out
 
 
 def train_classifier(
@@ -203,6 +221,12 @@ def train_classifier(
     out_dir: str,
     device: str = "cuda",
 ):
+    model_selection_metric = (
+        hyperparameters["model_selection_metric"]
+        if "model_selection_metric" in hyperparameters
+        else "auc"
+    )
+
     num_classes = len(classes)
     model_loss_fn = torch.nn.BCEWithLogitsLoss()
     lr_name = "model_lr" if "model_lr" in hyperparameters else "lr"
@@ -210,7 +234,10 @@ def train_classifier(
     model_scheduler = ReduceLROnPlateau(
         model_trainer, "min", patience=0, cooldown=5, min_lr=hyperparameters["min_lr"]
     )
-    peak_dev_f1 = (-1, 0)  # keep track of the best f1 + epoch at which it was reached
+    peak_dev_score = (
+        -1,
+        0,
+    )  # keep track of the best f1 + epoch at which it was reached
     for epoch in range(hyperparameters["num_epochs"]):
         epoch_model_loss = 0
         for i, (fnames, labels, graphs) in enumerate(tqdm(train_loader)):
@@ -233,22 +260,65 @@ def train_classifier(
                 model_trainer.zero_grad()
         logging.info(f"Epoch {epoch + 1} model loss = {epoch_model_loss:.4}")
         tr_stats = evaluate(
-            model, train_loader, model_loss_fn, classes=classes, device=device
+            model,
+            train_loader,
+            model_loss_fn,
+            classes=classes,
+            device=device,
+            return_predictions=args.error_analysis,
         )
         logging.info(f"Training loss: {tr_stats['loss'].item():.4}")
         logging.info(f"Training stats: \n{tr_stats['stats']}")
-        dev_stats = evaluate(
-            model, dev_loader, model_loss_fn, classes=classes, device=device
-        )
-        logging.info(f"Dev loss: {dev_stats['loss'].item():.4}")
-        logging.info(f"Dev stats: \n{dev_stats['stats']}")
-        model_scheduler.step(dev_stats["loss"] / len(dev_loader))
-        if dev_stats["stats"]["f1"][1:].mean() >= peak_dev_f1[0]:
-            peak_dev_f1 = (dev_stats["stats"]["f1"][1:].mean(), epoch + 1)
-            if args.save_model:
-                torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
+        logging.info(f"Training AUC: {tr_stats['auc']}")
+        if dev_loader is not None:
+            dev_stats = evaluate(
+                model,
+                dev_loader,
+                model_loss_fn,
+                classes=classes,
+                device=device,
+                return_predictions=args.error_analysis,
+            )
+            logging.info(f"Dev loss: {dev_stats['loss'].item():.4}")
+            logging.info(f"Dev stats: \n{dev_stats['stats']}")
+            logging.info(f"Dev AUC: {dev_stats['auc']}")
+            if model_selection_metric in dev_stats:
+                score = dev_stats[model_selection_metric]
+            else:
+                score = dev_stats["stats"][model_selection_metric][1:].mean()
+            if score >= peak_dev_score[0]:
+                peak_dev_score = (score, epoch + 1)
+                if args.save_model:
+                    torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
+                if args.error_analysis:
+                    with open(
+                        os.path.join(out_dir, f"train_predictions.txt"), "w"
+                    ) as f:
+                        f.write(
+                            "\n".join(
+                                [
+                                    str(np.argmax(prediction.cpu()).item())
+                                    for prediction in tr_stats["predictions"]
+                                ]
+                            )
+                        )
+                    with open(os.path.join(out_dir, f"dev_predictions.txt"), "w") as f:
+                        f.write(
+                            "\n".join(
+                                [
+                                    str(np.argmax(prediction.cpu()).item())
+                                    for prediction in dev_stats["predictions"]
+                                ]
+                            )
+                        )
+        elif args.save_model:
+            torch.save(model.state_dict(), os.path.join(out_dir, "model.pt"))
+        model_scheduler.step(tr_stats["loss"] / len(train_loader))
     logging.info("******** Training complete ********")
-    logging.info(f"Peak dev minority f1 = {peak_dev_f1[0]} at epoch {peak_dev_f1[1]}")
+    if dev_loader is not None:
+        logging.info(
+            f"Peak dev minority {model_selection_metric} = {peak_dev_score[0]} at epoch {peak_dev_score[1]}"
+        )
     if test_loader is not None:
         if args.save_model:
             model.load_state_dict(torch.load(os.path.join(out_dir, "model.pt")))
@@ -259,9 +329,20 @@ def train_classifier(
             model_loss_fn,
             classes=classes,
             device=device,
-            out_dir=out_dir,
+            return_predictions=args.error_analysis,
         )
+        if args.error_analysis:
+            with open(os.path.join(out_dir, f"test_predictions.txt"), "w") as f:
+                f.write(
+                    "\n".join(
+                        [
+                            str(np.argmax(prediction.cpu()).item())
+                            for prediction in test_stats["predictions"]
+                        ]
+                    )
+                )
         logging.info(f"Test stats: \n{test_stats['stats']}")
+        logging.info(f"Test AUC: {test_stats['auc']}")
     if args.delete_model:
         os.remove(os.path.join(out_dir, "model.pt"))
 
@@ -275,7 +356,7 @@ def main():
         with open(args.hyperparameters, "r") as f:
             hyperparameters = json.load(f)
 
-    # set random seed for reporoducibility
+    # set random seed for reproducibility
     torch.manual_seed(hyperparameters["random_seed"])
 
     # set name for out files
@@ -303,8 +384,8 @@ def main():
         if hyperparameters["batch_size"] > 1
         or hyperparameters["model_type"] == "HGT"
         or (
-            len(hyperparameters["motifs_to_use"]) > 1 \
-                and 0 in hyperparameters["motifs_to_use"]
+            len(hyperparameters["motifs_to_use"]) > 1
+            and 0 in hyperparameters["motifs_to_use"]
         )
         else False
     )
@@ -315,15 +396,23 @@ def main():
         cache=args.cache,
         task_names=args.task_names,
         num_data=hyperparameters["num_data"],
-        data_split=hyperparameters["data_split"],
+        data_split=(
+            hyperparameters["data_split"] if "data_split" in hyperparameters else None
+        ),
         batch_size=hyperparameters["batch_size"],
-        oversample=hyperparameters["oversample"],
+        oversample=(
+            hyperparameters["oversample"] if "oversample" in hyperparameters else None
+        ),
         homogenize=homogenize,
         emb_dim=hyperparameters["emb_input_dim"],
         use_doctime=hyperparameters["use_doctime"],
         motifs_to_use=hyperparameters["motifs_to_use"],
         motifs_dir=args.motifs_dir,
-        temporal_closure=hyperparameters["temporal_closure"]
+        temporal_closure=(
+            hyperparameters["temporal_closure"]
+            if "temporal_closure" in hyperparameters
+            else False
+        ),
     )
 
     vocab_size = len(vocab)

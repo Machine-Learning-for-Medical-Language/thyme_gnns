@@ -11,22 +11,6 @@ from utils import get_device
 DEVICE = get_device()
 
 
-def homogenize(
-    g: dgl.DGLGraph,
-    ndata: Optional[list] = None,
-    edata: Optional[list] = None,
-    store_type: bool = True,
-) -> dgl.DGLGraph:
-    # by default, keep all ndata and edata
-    if ndata is None:
-        ndata = g.ndata.keys()
-    if edata is None:
-        edata = g.edata.keys()
-    if store_type:
-        return
-    return dgl.to_homogeneous(g, ndata=ndata, edata=edata)
-
-
 # for overriding dgl's homogenization.
 # need to make this a full class so we can initialize it with edge vocab.
 # TODO node types as well? not really an issue
@@ -84,9 +68,9 @@ class NodeEmbedding(nn.Module):
                 vocab_len, emb_size, _freeze=freeze, padding_idx=0
             ).to(DEVICE)
             with torch.no_grad():
-                self.embed.weight[
-                    0
-                ] = padding_token_value  # empty token gets xt low value to minimize influence
+                self.embed.weight[0] = (
+                    padding_token_value  # empty token gets xt low value to minimize influence
+                )
         else:
             self.embed = nn.Embedding(vocab_len, emb_size, _freeze=freeze).to(DEVICE)
 
@@ -97,7 +81,7 @@ class NodeEmbedding(nn.Module):
         if len(g.ntypes) == 1:
             g.ndata["h"] = self.embed(g.ndata["tokens"])
         else:
-            for ntype in g.ntypes:
+            for ntype in g.ndata["tokens"].keys():
                 g.nodes[ntype].data["h"] = self.embed(g.ndata["tokens"][ntype])
         return g
 
@@ -143,7 +127,6 @@ class EdgeEmbedding(nn.Module):
                 i = self.stoi[etype]
             except KeyError:
                 i = self.stoi[(etype[0], "<unk>", etype[2])]
-                # pdb.set_trace()
             if isinstance(self.embed, nn.Parameter):
                 etype_embed = (
                     self.embed[i].unsqueeze(0).repeat(g[etype].num_edges(), 1, 1)
@@ -154,6 +137,39 @@ class EdgeEmbedding(nn.Module):
                 )
             embed_dct[etype] = etype_embed
         g.edata["w"] = embed_dct
+        return g
+
+
+class TimeEmbedding(nn.Module):
+    def __init__(
+        self,
+        emb_size: int = 768,
+        freeze: bool = False,
+        f: Callable = torch.sin,
+    ):
+        super().__init__()
+        self.w0 = nn.parameter.Parameter(torch.randn(1), requires_grad=not freeze)
+        self.b0 = nn.parameter.Parameter(torch.randn(1), requires_grad=not freeze)
+        self.w = nn.parameter.Parameter(
+            torch.randn(emb_size - 1), requires_grad=not freeze
+        )
+        self.b = nn.parameter.Parameter(
+            torch.randn(emb_size - 1), requires_grad=not freeze
+        )
+        self.f = f
+
+    def time2vec(self, input: torch.Tensor):
+        input = input.unsqueeze(1)
+        out = [
+            ((input * self.w0) + self.b0),
+            self.f(torch.matmul(input, self.w.unsqueeze(0)) + self.b),
+        ]
+        return torch.cat(out, 1)
+
+    def forward(self, g: dgl.DGLGraph):
+        g.nodes["normed_time"].data["h"] = self.time2vec(
+            g.ndata["relative_time"]["normed_time"]
+        )
         return g
 
 
@@ -203,3 +219,22 @@ class TransposePool(nn.Module):
                 if squeeze:
                     input[key] = torch.squeeze(input[key])
             return input
+
+
+class EdgePool(nn.Module):
+    def __init__(
+        self,
+        in_size: int,
+        out_size: int,
+    ):
+        super().__init__()
+        if in_size != out_size:
+            self.pool = nn.Linear(in_size, out_size)
+        else:
+            self.pool = lambda x: x
+
+    def forward(
+        self,
+        feats: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.pool(feats)

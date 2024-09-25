@@ -5,7 +5,14 @@ from torch import nn
 import torchtext
 from collections import OrderedDict
 from dgl.nn.pytorch.utils import JumpingKnowledge
-from model_utils import Homogenizer, NodeEmbedding, EdgeEmbedding, TransposePool
+from model_utils import (
+    Homogenizer,
+    NodeEmbedding,
+    EdgeEmbedding,
+    TimeEmbedding,
+    TransposePool,
+    EdgePool,
+)
 from typing import List, Set, Dict, Tuple, Union, Optional, Callable
 from utils import get_device
 from redefined_modules import HGTConv
@@ -47,6 +54,7 @@ class Classifier(nn.Module):
                     freeze,
                     padding_token_value=padding_token_value,
                 )
+        self.time_embedding = TimeEmbedding(emb_input_dim, freeze)
         self.add_self_loop = add_self_loop
         self.weight_edges = weight_edges
         if self.weight_edges:
@@ -56,7 +64,8 @@ class Classifier(nn.Module):
 
         self.tokens_pool = TransposePool(1, nn.AdaptiveMaxPool1d)
         self.nodes_pool = TransposePool(1, nn.AdaptiveAvgPool1d)
-        self.linear = nn.Linear(emb_output_dim, num_classes)
+        out_dim = emb_output_dim if emb_output_dim is not None else emb_input_dim
+        self.linear = nn.Linear(out_dim, num_classes)
         self.sigmoid = nn.Sigmoid()
 
     def forward(
@@ -71,27 +80,28 @@ class Classifier(nn.Module):
             g.ndata["h"] = feat
         if "h" not in g.ndata.keys():  # h = node embeddings
             g = self.node_embedding(g)
+        if "normed_time" in g.ntypes:  # need to give normed_time nodes embeddings
+            g = self.time_embedding(g)
+        for ntype in g.ntypes:
+            if g.ndata["h"][ntype].dim() > 2:
+                g.nodes[ntype].data["h"] = self.tokens_pool(
+                    g.ndata["h"][ntype], dim0=1, dim1=2
+                ).squeeze(-1)
         if self.weight_edges:
-            if eweight is None:
-                g = self.edge_embedding(
-                    g
-                )  # w = edge embeddings (not required for most models)
-            else:
-                g.edata["w"] = eweight
+            g = self.edge_embedding(g)
             if not g.is_homogeneous:
-                g = self.homogenize(g)
+                g = self.homogenize(g, ndata=["h"])
         # homogenizing makes computation easier from here on out
         # we homogenize *after* getting embeddings, so that edges' types are represented in their embeddings
         if not g.is_homogeneous:
-            g = self.homogenize(g, edata=[])
+            g = self.homogenize(g, ndata=["h"], edata=[])
         if self.add_self_loop:
             g = dgl.add_self_loop(g)
         # commented out because our graphs *shouldn't* include nodes with zero in-degree
         # elif not self.allow_zero_in_degree:
         #     nonzero_nodes = torch.where(g.in_degrees()>0)[0]
         #     g = dgl.node_subgraph(g, nonzero_nodes, output_device=DEVICE)
-        if g.ndata["h"].dim() > 2:
-            g.ndata["h"] = self.tokens_pool(g.ndata["h"], dim0=1, dim1=2, squeeze=True)
+
         if (
             get_attention
         ):  # for post-hoc model examination purposes. can only be used with graph attention networks.
@@ -151,18 +161,28 @@ class GCNClassifier(Classifier):
             padding_token_value=padding_token_value,
             allow_zero_in_degree=allow_zero_in_degree,
         )
-        self.convs, self.edge_pools = [], []
-        dims = [emb_input_dim] + hidden_dim + [emb_output_dim]
-        for i in range(len(dims) - 1):
-            self.convs.append(
-                dgl.nn.pytorch.GraphConv(
-                    dims[i],
-                    dims[i + 1],
-                    weight=conv_weight,
-                    bias=conv_bias,
-                    allow_zero_in_degree=allow_zero_in_degree,
-                ).to(DEVICE)
-            )
+        self.convs, self.edge_pools = nn.ModuleList(), nn.ModuleList()
+        self.conv_weight = conv_weight
+        if emb_output_dim is None:
+            dims = [emb_input_dim]
+        else:
+            dims = [emb_input_dim] + hidden_dim + [emb_output_dim]
+            for i in range(len(dims) - 1):
+                # keeping this outside of the loop below so that these are initialized the same way
+                # in GCN and in MultiHeadGCN
+                self.edge_pools.append(EdgePool(dims[i], dims[i + 1]))
+            for i in range(len(dims) - 1):
+                conv_weight = True if dims[i] != dims[i + 1] else self.conv_weight
+                self.convs.append(
+                    dgl.nn.pytorch.GraphConv(
+                        dims[i],
+                        dims[i + 1],
+                        weight=conv_weight,
+                        bias=conv_bias,
+                        # activation=torch.tanh,
+                        allow_zero_in_degree=allow_zero_in_degree,
+                    ).to(DEVICE)
+                )
 
         self.dropout = nn.Dropout(p=dr)
         self.agg_type = agg_type
@@ -192,12 +212,15 @@ class GCNClassifier(Classifier):
         self,
         g: dgl.DGLGraph,
     ) -> torch.Tensor:
-        _h = g.ndata["h"]
+        _h = torch.clone(g.ndata["h"])
         _hs = [_h]
         if self.weight_edges:
-            _w = g.edata["w"].squeeze(1)
+            _w = torch.clone(g.edata["w"])
+            if _w.dim() > 2:
+                _w = _w.squeeze()
         for i in range(len(self.convs)):
             if self.weight_edges:
+                _w = self.edge_pools[i](_w)
                 _h = self.convs[i](g, _h, edge_weight=_w)
             else:
                 _h = self.convs[i](g, _h)
@@ -215,15 +238,18 @@ class HeteroGCNClassifier(Classifier):
         emb_output_dim: int,
         node_vocab_size: int,
         edge_vocab: Union[Set, List],
-        ntypes: Union[Set, List],
+        padding_token_value: Optional[int],
         activation: Callable = nn.ReLU,
         num_classes: int = 2,
         dr: float = 0.0,
-        num_convs: int = 5,
         pretrained: bool = False,
         freeze: bool = False,
         pretrained_embmat_dir: Optional[str] = None,
         weight_edges: bool = False,
+        agg_type: Optional[str] = None,
+        heterographconv_agg_type: str = "sum",
+        add_self_loop: bool = False,
+        allow_zero_in_degree: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -231,33 +257,50 @@ class HeteroGCNClassifier(Classifier):
             emb_output_dim=emb_output_dim,
             node_vocab_size=node_vocab_size,
             edge_vocab=edge_vocab,
-            ntypes=ntypes,
             pretrained=pretrained,
             freeze=freeze,
             pretrained_embmat_dir=pretrained_embmat_dir,
             weight_edges=weight_edges,
+            padding_token_value=padding_token_value,
+            num_classes=num_classes,
+            add_self_loop=add_self_loop,
+            allow_zero_in_degree=allow_zero_in_degree,
         )
-        if isinstance(edge_vocab, torchtext.vocab.Vocab):
-            edge_vocab = edge_vocab.get_stoi()
-        elif isinstance(edge_vocab, dict):
-            edge_vocab = edge_vocab
+        # if isinstance(edge_vocab, torchtext.vocab.Vocab):
+        #     edge_vocab = edge_vocab.get_stoi()
+        # elif isinstance(edge_vocab, dict):
+        #     edge_vocab = edge_vocab
+        edge_vocab = sorted(edge_vocab)
         self.convs = []
+        self.dropout = nn.Dropout(p=dr)
         dims = [emb_input_dim] + hidden_dim + [emb_output_dim]
         for i in range(len(dims) - 1):
             self.convs.append(
                 dgl.nn.pytorch.HeteroGraphConv(
                     {
                         etype: dgl.nn.pytorch.GraphConv(
-                            dims[i], dims[i + 1], norm="both", allow_zero_in_degree=True
+                            dims[i],
+                            dims[i + 1],
+                            norm="both",
                         ).to(DEVICE)
                         for etype in edge_vocab
-                    }
+                    },
+                    aggregate=heterographconv_agg_type,
                 )
             )
-        self.activation = activation()
+        self.activation = activation
+        self.agg_type = agg_type
+        if self.agg_type is not None:
+            self.jumping_knowledge = JumpingKnowledge(
+                mode=self.agg_type,
+                in_feats=emb_output_dim,
+                num_layers=len(self.convs) + 1,
+            )
         # typed linear overrides super() linear
+        ntypes = sorted({etype[0] for etype in edge_vocab})
+        linear_dim = sum(dims) if self.agg_type == "cat" else dims[-1]
         self.linear = dgl.nn.pytorch.HeteroLinear(
-            {ntype: emb_output_dim for ntype in ntypes}, num_classes
+            {ntype: linear_dim for ntype in ntypes}, num_classes
         )
         self.end_pool = TransposePool(1, nn.AdaptiveMaxPool1d)
 
@@ -267,27 +310,33 @@ class HeteroGCNClassifier(Classifier):
     ) -> torch.Tensor:
         if not self.pretrained:
             g = self.node_embedding(g)
+            pooled_h = self.tokens_pool(g.ndata["h"], dim0=1, dim1=2)
+            for key in pooled_h:
+                pooled_h[key] = pooled_h[key].squeeze(2)
+            g.ndata["h"] = pooled_h
+        if "normed_time" in g.ntypes:
+            g = self.time_embedding(g)
         # g = self.edge_embedding(g)
         _h = g.ndata["h"]
         if isinstance(_h, torch.Tensor):  # only one ntype
             _h = {g.ntypes[0]: _h}
 
+        _hs = {ntype: [_h[ntype]] for ntype in g.ntypes}
         for conv in self.convs:
             _h = conv(g, _h)
-
-        _h = self.tokens_pool(_h, dim0=1, dim1=2)
-        # shape should be (num_nodes, emb_dim, 1)
-        _h = self.nodes_pool(_h, dim0=0, dim1=2)
-        # shape should be (1, emb_dim, 1)
-        # self.indices = indices
-        for ntype in g.ntypes:
-            _h[ntype] = torch.transpose(_h[ntype], dim0=0, dim1=2)
-            _h[ntype] = torch.squeeze(_h[ntype])
+            for ntype in g.ntypes:
+                _hs[ntype].append(_h[ntype])
+        if self.agg_type is not None:
+            _h = {
+                ntype: self.dropout(self.jumping_knowledge(_hs[ntype]))
+                for ntype in g.ntypes
+            }
         _h = self.linear(_h)
-        _h = torch.stack([_h[key] for key in _h])[0]
+        _h = torch.cat([_h[key] for key in _h], 0)  # [0]
+        # shape should be [num_nodes, 2]
         if _h.dim() > 1:
-            _h = self.end_pool(_h, dim0=0, dim1=1)
-        return _h.unsqueeze(0)
+            _h = self.end_pool(_h, dim0=0, dim1=1).t()
+        return _h
 
 
 class HGTClassifier(Classifier):

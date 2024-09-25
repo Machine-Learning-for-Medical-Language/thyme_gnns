@@ -2,6 +2,7 @@ from collections import defaultdict
 import os
 
 os.environ["DGLBACKEND"] = "pytorch"
+import copy
 import dgl
 import json
 import logging
@@ -24,8 +25,8 @@ from typing import Any, List, Set, Dict, Tuple, Union, Optional, Callable
 from utils import get_device
 
 
-# DEVICE = get_device()
-DEVICE = "cpu"
+DEVICE = get_device()
+# DEVICE = "cpu"
 
 doctime_etypes = {
     ("event", "AFTER", "DocTime"),
@@ -141,7 +142,7 @@ def load_data_dir(
 
 
 def get_vocab_and_pipeline(
-    train_data: Dict[str, Dict]
+    train_data: Dict[str, Dict], temporal_closure: bool
 ) -> Tuple[torchtext.vocab.Vocab, Callable]:
     tokenizer = get_tokenizer("basic_english")
 
@@ -152,13 +153,15 @@ def get_vocab_and_pipeline(
         data_iter,
     ):  # given a graph, get all of its entities, and tokenize the text of all of those entities
         for dct in data_iter:
-            all_entities = dct["event"]
-            all_entities.update(dct["timex"])
+            all_entities = {}
+            all_entities.update(dct["event"])
+            if "timex" in dct:
+                all_entities.update(dct["timex"])
             for entity in all_entities:
                 yield tokenizer(all_entities[entity]["text"])
 
     vocab = torchtext.vocab.build_vocab_from_iterator(
-        yield_tokens(iter(train_data)), specials=["<pad>", "<unk>"]
+        yield_tokens(iter(copy.deepcopy(train_data))), specials=["<pad>", "<unk>"]
     )
     vocab.set_default_index(vocab["<unk>"])
 
@@ -170,30 +173,68 @@ def get_vocab_and_pipeline(
             ("event", "<unk>", "timex"),
             ("timex", "<unk>", "event"),
         }
+        if temporal_closure:
+            edge_categories.add(("timex", "<unk>", "timex"))
         for dct in data_iter:
             for event in dct["event"]:
-                if event.startswith("Timex"):  # time expressions don't have doctimerel
+                if event.lower().startswith(
+                    "timex"
+                ):  # time expressions don't have doctimerel
                     continue
                 edge_categories.add(("event", dct["event"][event]["dtr"], "DocTime"))
                 edge_categories.add(
                     ("DocTime", category_reverse(dct["event"][event]["dtr"]), "event")
                 )
-                edge_categories.add(("timex", dct["event"][event]["dtr"], "DocTime"))
-                edge_categories.add(
-                    ("DocTime", category_reverse(dct["event"][event]["dtr"]), "timex")
+                if temporal_closure:
+                    edge_categories.add(
+                        ("timex", dct["event"][event]["dtr"], "DocTime")
+                    )
+                    edge_categories.add(
+                        (
+                            "DocTime",
+                            category_reverse(dct["event"][event]["dtr"]),
+                            "timex",
+                        )
+                    )
+            if "normed_time" in dct:
+                edge_categories.update(
+                    {
+                        ("event", "<unk>", "normed_timex"),
+                        ("normed_timex", "<unk>", "normed_timex"),
+                    }
                 )
+                for normed_time in dct["normed_time"]:
+                    edge_categories.add(
+                        (
+                            "normed_time",
+                            dct["normed_time"][normed_time]["dtr"],
+                            "DocTime",
+                        )
+                    )
+                    edge_categories.add(
+                        (
+                            "DocTime",
+                            category_reverse(dct["normed_time"][normed_time]["dtr"]),
+                            "normed_time",
+                        )
+                    )
             for relation in dct["relations"]:  # inter-entity relations
-                arg1_type = relation["arg1"].split("_")[0].lower()
-                arg2_type = relation["arg2"].split("_")[0].lower()
+                arg1_type = "_".join(relation["arg1"].split("_")[:-1]).lower()
+                arg2_type = "_".join(relation["arg2"].split("_")[:-1]).lower()
                 category = relation["category"]
+                reverse_category = category_reverse(category)
                 edge_categories.add((arg1_type, category, arg2_type))
-                edge_categories.add((arg2_type, category_reverse(category), arg1_type))
+                edge_categories.add((arg2_type, reverse_category, arg1_type))
+                if temporal_closure:
+                    edge_categories.add(("timex", category, "timex"))
+                    edge_categories.add(("timex", reverse_category, "timex"))
+
         edge_categories = {
             cat: i for i, cat in enumerate(edge_categories)
         }  # edge type to i
         return edge_categories
 
-    edge_vocab = get_edge_categories(train_data)
+    edge_vocab = get_edge_categories(copy.deepcopy(train_data))
 
     def text_pipeline(x, max_len):
         tokens = tokenize(x)
@@ -225,6 +266,7 @@ def make_relations(
     datum: Dict,
     known_etypes: List,
     use_doctime: bool = True,
+    pretrained: bool = False,
 ) -> Dict:
     entity_ids = defaultdict(lambda: {})
     if use_doctime:
@@ -233,7 +275,10 @@ def make_relations(
     datum["event"] = {
         event: datum["event"][event]
         for event in datum["event"]
-        if (not event.startswith("Timex")) and datum["event"][event]["text"].isascii()
+        if (not event.startswith("Timex"))
+        and (
+            datum["event"][event]["text"].isascii() or pretrained
+        )  # if bert can handle a string, we don't care if it's ascii or not
     }
     for i, event in enumerate(datum["event"]):
         entity_ids["event"][event] = i
@@ -251,15 +296,40 @@ def make_relations(
             graph_data[("DocTime", reverse_doctimerel, "event")]["destinations"].append(
                 i
             )
+    if "normed_time" in datum:
+        for i, normed_time in enumerate(datum["normed_time"]):
+            entity_ids["normed_time"][normed_time] = i
+            # get doctimerel
+            if use_doctime:
+                doctimerel = datum["normed_time"][normed_time]["dtr"]
+                graph_data[("normed_time", doctimerel, "DocTime")]["sources"].append(i)
+                graph_data[("normed_time", doctimerel, "DocTime")][
+                    "destinations"
+                ].append(
+                    0
+                )  # idx of DocTime node
+                reverse_doctimerel = category_reverse(doctimerel)
+                graph_data[("DocTime", reverse_doctimerel, "normed_time")][
+                    "sources"
+                ].append(
+                    0
+                )  # idx of DocTime node
+                graph_data[("DocTime", reverse_doctimerel, "normed_time")][
+                    "destinations"
+                ].append(i)
     for relation in datum["relations"]:
         arg1 = relation["arg1"]
         arg2 = relation["arg2"]
-        arg1_type = arg1.split("_")[0].lower()
-        arg2_type = arg2.split("_")[0].lower()
-        if (arg1_type == "event" and arg1 not in entity_ids["event"]) or (
-            arg2_type == "event" and arg2 not in entity_ids["event"]
+        arg1_type = "_".join(arg1.split("_")[:-1]).lower()
+        arg2_type = "_".join(arg2.split("_")[:-1]).lower()
+        if (
+            (arg1_type == "event" and arg1 not in entity_ids["event"])
+            or (arg2_type == "event" and arg2 not in entity_ids["event"])
+            or (arg1_type == "normed_time" and arg1 not in entity_ids["normed_time"])
+            or (arg2_type == "normed_time" and arg2 not in entity_ids["normed_time"])
         ):
             continue
+
         # timexes get added here to eliminate those that are not actually used
         # (events are all used, bc of their DocTimeRel)
         if arg1_type == "timex":
@@ -301,16 +371,29 @@ def graphify(
 ) -> List[dgl.DGLGraph]:
     logging.info("Graphifying data")
     out = []
+    homogenizer = Homogenizer(edge_vocab)
     for datum in tqdm(data):  # datum = one graph/one file
-        datum["timex"] = {timex: datum["timex"][timex] for timex in datum["timex"] if timex.startswith("Timex")}
-        datum["event"] = {event: datum["event"][event] for event in datum["event"] if event.startswith("Event")}
+        if "timex" in datum:
+            datum["timex"] = {
+                timex: datum["timex"][timex]
+                for timex in datum["timex"]
+                if timex.lower().startswith("timex")
+            }
+        datum["event"] = {
+            event: datum["event"][event]
+            for event in datum["event"]
+            if event.lower().startswith("event")
+        }
         if temporal_closure:
             graph_data, entity_ids = extrapolate(datum)
-            graph_data = {etype: (graph_data[etype][0].to(int), graph_data[etype][1].to(int)) for etype in graph_data}  # to appease dgl
+            graph_data = {
+                etype: (graph_data[etype][0].to(int), graph_data[etype][1].to(int))
+                for etype in graph_data
+            }  # to appease dgl
         else:
             graph_data, entity_ids = make_relations(
-                datum, edge_vocab, use_doctime=use_doctime
-            )  
+                datum, edge_vocab, use_doctime=use_doctime, pretrained=pretrained
+            )
             # just node indices, representing edges between them
             for etype in graph_data:
                 graph_data[etype] = (
@@ -338,10 +421,15 @@ def graphify(
         if num_nodes == 0:  # empty graph
             continue
         g = dgl.heterograph(graph_data).to(DEVICE)
-        tokens = {}
+        if (homogenizer(g, ndata=[], edata=[]).in_degrees() == 0).any():
+            pdb.set_trace()
         if not pretrained:
             for ntype in g.ntypes:
-                if ntype in datum and isinstance(datum[ntype], dict):
+                if (
+                    ntype in datum
+                    and isinstance(datum[ntype], dict)
+                    and ntype != "normed_time"
+                ):
                     # eliminate nodes that are isolated (cannot be used by algorithm)
                     old_datum_ntype = datum[ntype]
                     datum[ntype] = {
@@ -350,21 +438,26 @@ def graphify(
                         if ent in entity_ids[ntype]
                         and entity_ids[ntype][ent] in g.nodes(ntype)
                     }
-                    # if len(old_datum_ntype) > len(datum[ntype]):  # and ntype!="timex":
-                    #     pdb.set_trace()
+                    if len(old_datum_ntype) > len(datum[ntype]):  # and ntype!="timex":
+                        pdb.set_trace()
                     # get text for each node
                     # put text through pipeline to get tokens
-                    tokens[ntype] = text_pipeline(
+                    g.nodes[ntype].data["tokens"] = text_pipeline(
                         [datum[ntype][ent]["text"] for ent in datum[ntype]], max_len
                     ).to(DEVICE)
+
                 elif ntype == "DocTime":
-                    tokens[ntype] = text_pipeline(["<pad>"], max_len).to(DEVICE)
-            if len(g.ntypes) > 1:
-                g.ndata["tokens"] = tokens
-            else:
-                # graph is effectively homogeneous;
-                # dgl will complain if data is not given in tensor format
-                g.ndata["tokens"] = tokens[g.ntypes[0]]
+                    g.nodes["DocTime"].data["tokens"] = text_pipeline(
+                        ["<pad>"], max_len
+                    ).to(DEVICE)
+        if "normed_time" in g.ntypes:
+            g.nodes["normed_time"].data["relative_time"] = torch.tensor(
+                [
+                    datum["normed_time"][ent]["relative_time"]
+                    for ent in datum["normed_time"]
+                ],
+                device=DEVICE,
+            )
         # if (g["timex"].in_degrees() == 0).any():
         #     isolated_nodes = g.in_degrees()==0
         #     g.remove_node(isolated_nodes, ntype="timex")
@@ -402,11 +495,16 @@ def get_loader(
                 }
                 for ntype in embeddings:
                     embeddings[ntype] = embeddings[ntype].to(DEVICE)
-                embeddings["DocTime"] = (
-                    torch.ones((1, 1, emb_dim)).to(DEVICE).detach()
-                )
+                # if "DocTime" not in embeddings:
+                #     embeddings["DocTime"] = (
+                #         torch.ones((1, 1, emb_dim)).to(DEVICE).detach()
+                #     )
                 try:
-                    g.ndata["h"] = embeddings
+                    for ntype in g.ntypes:
+                        # if "tokens" in g.nodes[ntype].data.keys():
+                        if ntype in embeddings:
+                            # g.ndata["h"][ntype] = embeddings[ntype]
+                            g.nodes[ntype].data["h"] = embeddings[ntype]
                 except:
                     pdb.set_trace()
                 if homogenize:
@@ -470,54 +568,58 @@ def get_data_loaders(
     task_names: List[str],
     batch_size: int,
     max_len: int = 4,
-    num_data: int = 0,
-    data_split: List[float] = [0.8, 0.1, 0.1],
+    num_data: int = -1,
+    data_split: Optional[List[float]] = [0.8, 0.1, 0.1],
     oversample: float = None,
     cache: str = None,
     homogenize: bool = False,
     emb_dim: int = 100,
-    use_doctime: bool = "True",
-    temporal_closure: bool = "False",
+    use_doctime: bool = True,
+    temporal_closure: bool = False,
     motifs_to_use: List[int] = [0],
     motifs_dir: Optional[str] = None,
 ) -> Tuple[torchtext.vocab.Vocab, GraphDataLoader, GraphDataLoader, GraphDataLoader]:
-    num_train_data = math.floor(data_split[0] * num_data)
-    num_dev_data = math.floor(data_split[1] * num_data)
-    num_test_data = math.floor(data_split[2] * num_data)
+    if num_data > 0:
+        num_train_data = math.floor(data_split[0] * num_data)
+        num_dev_data = math.floor(data_split[1] * num_data)
+        num_test_data = math.floor(data_split[2] * num_data)
+    else:
+        num_train_data = num_dev_data = num_test_data = (
+            -1
+        )  # when splits are predetermined
 
     task_name = task_names[0]
 
     def cachename(base: str):
-        base += (
-            f"_{task_name}_os{str(oversample).split('.')[1]}"
-            if oversample is not None
-            else ""
-        )
-        base += (
-            "_temporal_closure"
-            if temporal_closure
-            else ""
-        )
+        base += f"_os{str(oversample).split('.')[1]}" if oversample is not None else ""
+        base += "_temporal_closure" if temporal_closure else ""
         return base + ".pt"
 
-    train_cache = cachename(f"train_{num_train_data}")
-    dev_cache = cachename(f"dev_{num_dev_data}")
-    test_cache = cachename(f"test_{num_test_data}")
-    vocab_cache = cachename(f"vocab_{num_train_data}")
+    train_cache = cachename(f"train_{num_train_data}_{task_name}")
+    dev_cache = cachename(f"dev_{num_dev_data}_{task_name}")
+    test_cache = cachename(f"test_{num_test_data}_{task_name}")
+    vocab_cache = cachename(f"vocab_{num_train_data}_{task_name}")
     if cache is not None and os.path.isfile(os.path.join(cache, train_cache)):
         train = torch.load(os.path.join(cache, train_cache))
 
         fnames, labels, graphs = zip(*train)
         label_set = set(
-            [indiv_label for label_lst in labels for indiv_label in label_lst]
+            # [indiv_label for label_lst in labels for indiv_label in label_lst]
+            [label.item() for label in labels]
         )
         label_dct = {label: i for i, label in enumerate(label_set)}
 
         def label_pipeline(x):
-            return [label_dct[y[0]] for y in x]
+            return [label_dct[y.item()] for y in x]
 
-        dev = torch.load(os.path.join(cache, dev_cache))
-        test = torch.load(os.path.join(cache, test_cache))
+        try:
+            dev = torch.load(os.path.join(cache, dev_cache))
+        except FileNotFoundError:
+            dev = None
+        try:
+            test = torch.load(os.path.join(cache, test_cache))
+        except FileNotFoundError:
+            test = None
         vocab = torch.load(os.path.join(cache, vocab_cache))
         edge_vocab = {etype for graph in graphs for etype in graph.canonical_etypes}
         edge_vocab.update(doctime_etypes)
@@ -538,7 +640,9 @@ def get_data_loaders(
 
         fnames, labels, graphs = train
         assert isinstance(labels[0], np.ndarray)
-        vocab, edge_vocab, text_pipeline = get_vocab_and_pipeline(graphs)
+        vocab, edge_vocab, text_pipeline = get_vocab_and_pipeline(
+            graphs, temporal_closure=temporal_closure
+        )
         label_set = set(
             [indiv_label for label_lst in labels for indiv_label in label_lst]
         )

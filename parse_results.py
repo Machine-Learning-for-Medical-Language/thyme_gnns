@@ -42,24 +42,30 @@ if __name__ == "__main__":
                         train_blocks.append(this_block)
                     in_dev_block = True
                     this_block = [line]
+                elif "Training complete" in line:
+                    dev_blocks.append(this_block)
+                    this_block = []
                 elif in_train_block or in_dev_block:
                     this_block.append(line)
                 elif "Loading" in line:
                     continue
                 else:
-                    print("this should not happen!")
-                    break
+                    print("unexpected line found: " + line)
+                    # break
             # get dev minority f1s
-            dev_min_f1s = [float(block[-1].split()[-2]) for block in dev_blocks]
-            if len(dev_min_f1s) == 0:
+            for i, block in enumerate(dev_blocks):
+                if len(block) == 0:
+                    dev_blocks = dev_blocks[:i]
+            dev_min_scores = [float(block[-1].split()[-1]) for block in dev_blocks]
+            if len(dev_min_scores) == 0:
                 continue
             this_run["epochs_completed"] = len(dev_blocks)
-            peak_dev_min_f1 = (max(dev_min_f1s), np.argmax(dev_min_f1s) + 1)
-            num_epochs_post_peak = len(epoch_blocks) - peak_dev_min_f1[1]
+            peak_dev_min_score = (max(dev_min_scores), np.argmax(dev_min_scores))
+            num_epochs_post_peak = len(epoch_blocks) - peak_dev_min_score[1]
             if args.full_stats:
-                this_run["peak_epoch"] = peak_dev_min_f1[1] - 1
+                this_run["peak_epoch"] = peak_dev_min_score[1]
                 peak_dev = dev_blocks[this_run["peak_epoch"]]
-                stat_lines = peak_dev[-2:]
+                stat_lines = peak_dev[-3:-1]
                 for line in stat_lines:
                     stats = line.split()
                     category = stats[0]
@@ -67,20 +73,21 @@ if __name__ == "__main__":
                     this_run[f"precision_{category}"] = stats[2]
                     this_run[f"recall_{category}"] = stats[3]
                     this_run[f"f1_{category}"] = stats[4]
-                this_run
+                auc_line = peak_dev[-1]
+                this_run["auc"] = auc_line.split()[-1]
             else:
-                this_run["peak_min_f1"], this_run["peak_epoch"] = peak_dev_min_f1
+                this_run["peak_min_f1"], this_run["peak_epoch"] = peak_dev_min_score
 
             # get standard deviation in dev minority f1s after peak
             this_run["post_peak_f1_stdev"] = (
-                np.std(dev_min_f1s[peak_dev_min_f1[1] :])
+                np.std(dev_min_scores[peak_dev_min_score[1] :])
                 if num_epochs_post_peak > 1
                 else 0
             )
 
             # get loss at peak dev, final epoch
             model_losses = [float(line[0].split()[-1]) for line in epoch_blocks]
-            loss_at_peak = model_losses[peak_dev_min_f1[-1] - 1]
+            loss_at_peak = model_losses[peak_dev_min_score[-1] - 1]
             loss_at_end = model_losses[-1]
             loss_difference = loss_at_end - loss_at_peak
             this_run["loss_difference"] = loss_difference

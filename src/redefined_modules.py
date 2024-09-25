@@ -1,4 +1,5 @@
 """Heterogeneous Graph Transformer"""
+
 # pylint: disable= no-member, arguments-differ, invalid-name
 import math
 
@@ -10,8 +11,6 @@ from dgl.nn.pytorch.linear import TypedLinear
 from dgl.nn.pytorch.softmax import edge_softmax
 
 from dgl.ops import gather_mm, segment_mm
-
-import pdb
 
 
 class HGTConv(nn.Module):
