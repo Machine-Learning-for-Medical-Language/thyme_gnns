@@ -265,12 +265,10 @@ def category_reverse(category: str) -> str:
 def make_relations(
     datum: Dict,
     known_etypes: List,
-    use_doctime: bool = True,
     pretrained: bool = False,
 ) -> Dict:
     entity_ids = defaultdict(lambda: {})
-    if use_doctime:
-        entity_ids["DocTime"] = {"DocTime": 0}
+    entity_ids["DocTime"] = {"DocTime": 0}
     graph_data = defaultdict(lambda: {"sources": [], "destinations": []})
     datum["event"] = {
         event: datum["event"][event]
@@ -283,40 +281,34 @@ def make_relations(
     for i, event in enumerate(datum["event"]):
         entity_ids["event"][event] = i
         # get doctimerel
-        if use_doctime:
-            doctimerel = datum["event"][event]["dtr"]
-            graph_data[("event", doctimerel, "DocTime")]["sources"].append(i)
-            graph_data[("event", doctimerel, "DocTime")]["destinations"].append(
-                0
-            )  # idx of DocTime node
-            reverse_doctimerel = category_reverse(doctimerel)
-            graph_data[("DocTime", reverse_doctimerel, "event")]["sources"].append(
-                0
-            )  # idx of DocTime node
-            graph_data[("DocTime", reverse_doctimerel, "event")]["destinations"].append(
-                i
-            )
+        doctimerel = datum["event"][event]["dtr"]
+        graph_data[("event", doctimerel, "DocTime")]["sources"].append(i)
+        graph_data[("event", doctimerel, "DocTime")]["destinations"].append(
+            0
+        )  # idx of DocTime node
+        reverse_doctimerel = category_reverse(doctimerel)
+        graph_data[("DocTime", reverse_doctimerel, "event")]["sources"].append(
+            0
+        )  # idx of DocTime node
+        graph_data[("DocTime", reverse_doctimerel, "event")]["destinations"].append(i)
     if "normed_time" in datum:
         for i, normed_time in enumerate(datum["normed_time"]):
             entity_ids["normed_time"][normed_time] = i
             # get doctimerel
-            if use_doctime:
-                doctimerel = datum["normed_time"][normed_time]["dtr"]
-                graph_data[("normed_time", doctimerel, "DocTime")]["sources"].append(i)
-                graph_data[("normed_time", doctimerel, "DocTime")][
-                    "destinations"
-                ].append(
-                    0
-                )  # idx of DocTime node
-                reverse_doctimerel = category_reverse(doctimerel)
-                graph_data[("DocTime", reverse_doctimerel, "normed_time")][
-                    "sources"
-                ].append(
-                    0
-                )  # idx of DocTime node
-                graph_data[("DocTime", reverse_doctimerel, "normed_time")][
-                    "destinations"
-                ].append(i)
+            doctimerel = datum["normed_time"][normed_time]["dtr"]
+            graph_data[("normed_time", doctimerel, "DocTime")]["sources"].append(i)
+            graph_data[("normed_time", doctimerel, "DocTime")]["destinations"].append(
+                0
+            )  # idx of DocTime node
+            reverse_doctimerel = category_reverse(doctimerel)
+            graph_data[("DocTime", reverse_doctimerel, "normed_time")][
+                "sources"
+            ].append(
+                0
+            )  # idx of DocTime node
+            graph_data[("DocTime", reverse_doctimerel, "normed_time")][
+                "destinations"
+            ].append(i)
     for relation in datum["relations"]:
         arg1 = relation["arg1"]
         arg2 = relation["arg2"]
@@ -366,7 +358,6 @@ def graphify(
     text_pipeline: Callable,
     max_len: int = 4,
     pretrained: bool = False,
-    use_doctime: bool = True,
     temporal_closure: bool = False,
 ) -> List[dgl.DGLGraph]:
     logging.info("Graphifying data")
@@ -392,7 +383,7 @@ def graphify(
             }  # to appease dgl
         else:
             graph_data, entity_ids = make_relations(
-                datum, edge_vocab, use_doctime=use_doctime, pretrained=pretrained
+                datum, edge_vocab, pretrained=pretrained
             )
             # just node indices, representing edges between them
             for etype in graph_data:
@@ -574,7 +565,6 @@ def get_data_loaders(
     cache: str = None,
     homogenize: bool = False,
     emb_dim: int = 100,
-    use_doctime: bool = True,
     temporal_closure: bool = False,
     motifs_to_use: List[int] = [0],
     motifs_dir: Optional[str] = None,
@@ -657,7 +647,6 @@ def get_data_loaders(
             text_pipeline=text_pipeline,
             max_len=max_len,
             pretrained=pretrained_dir is not None,
-            use_doctime=use_doctime,
             temporal_closure=temporal_closure,
         )
         train = list(zip(fnames, labels, dgl_graphs))
@@ -669,7 +658,6 @@ def get_data_loaders(
             text_pipeline=text_pipeline,
             max_len=max_len,
             pretrained=pretrained_dir is not None,
-            use_doctime=use_doctime,
             temporal_closure=temporal_closure,
         )
         dev = list(zip(fnames, labels, dgl_graphs))
@@ -681,7 +669,6 @@ def get_data_loaders(
             text_pipeline=text_pipeline,
             max_len=max_len,
             pretrained=pretrained_dir is not None,
-            use_doctime=use_doctime,
             temporal_closure=temporal_closure,
         )
         test = list(zip(fnames, labels, dgl_graphs))
