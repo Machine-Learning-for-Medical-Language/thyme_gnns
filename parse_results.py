@@ -76,10 +76,9 @@ if __name__ == "__main__":
                 auc_line = peak_dev[-1]
                 this_run["auc"] = auc_line.split()[-1]
             else:
-                this_run["peak_min_f1"], this_run["peak_epoch"] = peak_dev_min_score
-
+                this_run["peak_min_auc"], this_run["peak_epoch"] = peak_dev_min_score
             # get standard deviation in dev minority f1s after peak
-            this_run["post_peak_f1_stdev"] = (
+            this_run["post_peak_auc_stdev"] = (
                 np.std(dev_min_scores[peak_dev_min_score[1] :])
                 if num_epochs_post_peak > 1
                 else 0
@@ -90,6 +89,7 @@ if __name__ == "__main__":
             loss_at_peak = model_losses[peak_dev_min_score[-1] - 1]
             loss_at_end = model_losses[-1]
             loss_difference = loss_at_end - loss_at_peak
+            this_run["loss_at_peak"] = loss_at_peak
             this_run["loss_difference"] = loss_difference
             this_run["loss_difference/remaining_epochs"] = (
                 loss_difference / num_epochs_post_peak
@@ -103,7 +103,7 @@ if __name__ == "__main__":
             last_epoch_time = " ".join(epoch_blocks[-1][0].split()[:2])
             last_epoch_dt = dt.strptime(last_epoch_time, "%Y-%m-%d %H:%M:%S,%f")
             td = last_epoch_dt - last_dev_dt
-            this_run["train_epoch_time"] = last_epoch_dt - last_dev_dt
+            this_run["train_epoch_time"] = str(last_epoch_dt - last_dev_dt)
             full[f"{_job}_{run_dir}"] = this_run
     full_df = pd.DataFrame.from_dict(full, orient="index")
     for col in full_df.columns:
